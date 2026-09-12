@@ -9,11 +9,20 @@ import {
   Sun, Zap, AlertTriangle, TrendingUp, TrendingDown, Wind, Droplets,
   Cloud, Thermometer, DollarSign, Leaf, Activity, RefreshCw, ChevronRight,
   LayoutDashboard, BellRing, Settings, BarChart2, Database, Power,
-  BatteryCharging, Battery, Clock, MapPin, Download, Filter, CheckCircle, Sliders, Shield
+  BatteryCharging, Battery, Clock, MapPin, Download, CheckCircle, Sliders, Shield, ChevronDown
 } from "lucide-react";
 
 const API_BASE = "http://127.0.0.1:8000";
 const API_KEY = "sun-theory-secret-key";
+
+const LOCATIONS = [
+  { name: "Solar Plant A — New Delhi",  lat: 28.6139, lon: 77.2090, code: "DEL" },
+  { name: "Solar Plant B — Mumbai",     lat: 19.0760, lon: 72.8777, code: "BOM" },
+  { name: "Solar Plant C — Chennai",    lat: 13.0827, lon: 80.2707, code: "MAA" },
+  { name: "Solar Plant D — Bengaluru",  lat: 12.9716, lon: 77.5946, code: "BLR" },
+  { name: "Solar Plant E — Jaipur",     lat: 26.9124, lon: 75.7873, code: "JAI" },
+];
+const REFRESH_INTERVAL = 300; // seconds
 
 const fetchWithKey = async (path: string) => {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -240,20 +249,38 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [activeRange, setActiveRange] = useState<24 | 48 | 72>(72);
   const [activeTab, setActiveTab] = useState("Dashboard");
+  // Feature: multi-location
+  const [selectedLocation, setSelectedLocation] = useState(LOCATIONS[0]);
+  const [locationOpen, setLocationOpen] = useState(false);
+  // Feature: auto-refresh countdown
+  const [countdown, setCountdown] = useState(REFRESH_INTERVAL);
+  // Feature: history comparison
+  const [historyForecast, setHistoryForecast] = useState<any[]>([]);
+  // Feature: live weather
+  const [currentWeather, setCurrentWeather] = useState<any>(null);
+  // Feature: notifications
+  const [notifiedIds, setNotifiedIds] = useState<Set<string>>(new Set());
+  // Feature: resolve alerts
+  const [resolvedAlertIds, setResolvedAlertIds] = useState<Set<string>>(new Set());
+
+  const visibleAlerts = alerts.filter(a => !resolvedAlertIds.has(a.id));
 
   const loadData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     else setRefreshing(true);
     setError(null);
     try {
+      const { lat, lon } = selectedLocation;
       const [forecastRes, alertsRes, metricsRes] = await Promise.all([
-        fetchWithKey("/forecast"),
-        fetchWithKey("/alerts"),
+        fetchWithKey(`/forecast?lat=${lat}&lon=${lon}`),
+        fetchWithKey(`/alerts?lat=${lat}&lon=${lon}`),
         fetchWithKey("/metrics"),
       ]);
 
       const raw = forecastRes.data;
       setRawForecast(raw);
+      setHistoryForecast(forecastRes.history ?? []);
+      setCurrentWeather(forecastRes.current_weather ?? null);
 
       const formatted = raw.map((f: any) => {
         const d = new Date(f.time);
@@ -269,17 +296,83 @@ export default function Dashboard() {
       setAlerts(alertsRes.data);
       setMetrics(metricsRes.data);
       setLastUpdated(new Date());
+      setCountdown(REFRESH_INTERVAL); // reset countdown on successful load
     } catch (e: any) {
       setError("Backend unavailable. Start uvicorn first: uvicorn main:app --port 8000");
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [selectedLocation]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
-  const slicedForecast = forecast.slice(0, activeRange);
+  // ── Auto-refresh countdown ──
+  useEffect(() => {
+    const id = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) { loadData(true); return REFRESH_INTERVAL; }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [loadData]);
+
+  // ── Browser notification permission (Feature 4) ──
+  useEffect(() => {
+    if (typeof window !== "undefined" && "Notification" in window) {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // ── Fire notifications for new critical alerts ──
+  useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) return;
+    if (Notification.permission !== "granted") return;
+    const critical = alerts.filter((a: any) => a.severity === "high" && !notifiedIds.has(a.id));
+    critical.forEach((alert: any) => {
+      new Notification("⚡ Critical Grid Alert — SUN THEORY", {
+        body: `${Math.round(alert.expected_shortfall)} MW shortfall at ${
+          new Date(alert.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        } · ${selectedLocation.name}`,
+        icon: "/favicon.ico",
+      });
+    });
+    if (critical.length > 0) {
+      setNotifiedIds(prev => new Set([...prev, ...critical.map((a: any) => a.id)]));
+    }
+  }, [alerts]);
+
+  // ── CSV Export handler (Feature 5) ──
+  const handleExportCSV = () => {
+    const headers = ["Timestamp", "Forecast (MW)", "Lower Bound", "Upper Bound", "Temp (°C)", "Cloud Cover (%)", "Wind (km/h)", "Solar Radiation (W/m²)"];
+    const rows = forecast.map((f: any) => [
+      f.fullTime,
+      f.forecast.toFixed(2),
+      f.confidence_lower?.toFixed(2) ?? "",
+      f.confidence_upper?.toFixed(2) ?? "",
+      f.temperature_2m?.toFixed(1) ?? "",
+      f.cloud_cover?.toFixed(0) ?? "",
+      f.wind_speed_10m?.toFixed(1) ?? "",
+      f.shortwave_radiation?.toFixed(1) ?? "",
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sun-theory-${selectedLocation.code}-${new Date().toISOString().split("T")[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Merge history into slicedForecast for overlay chart (Feature 3)
+  const slicedForecast = forecast.slice(0, activeRange).map((d, i) => ({
+    ...d,
+    previousForecast: historyForecast[i]?.forecast ?? undefined,
+  }));
   const peakGen = slicedForecast.length ? Math.max(...slicedForecast.map((d) => d.forecast)) : 0;
   const avgGen = slicedForecast.length
     ? slicedForecast.reduce((acc, d) => acc + d.forecast, 0) / slicedForecast.length
@@ -330,20 +423,44 @@ export default function Dashboard() {
 
   return (
     <div className="flex min-h-screen grid-bg">
-      <Sidebar alertCount={alerts.length} activeTab={activeTab} setActiveTab={setActiveTab} />
+      <Sidebar alertCount={visibleAlerts.length} activeTab={activeTab} setActiveTab={setActiveTab} />
 
       {/* Main content */}
       <div className="flex-1 flex flex-col overflow-auto">
         {/* Top bar */}
-        <header className="sticky top-0 z-20 flex items-center justify-between px-8 py-4 topbar-glass">
-          <div>
+        <header className="sticky top-0 z-20 flex items-center justify-between px-8 py-4 topbar-glass gap-4">
+          {/* Left: Title + location dropdown */}
+          <div className="flex-shrink-0">
             <h1 className="text-[17px] font-bold tracking-tight" style={{ background: "linear-gradient(135deg, #ffffff, rgba(52,211,153,0.85))", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
               Grid Operations Dashboard
             </h1>
-            <div className="flex items-center gap-3 mt-1">
-              <div className="weather-chip">
-                <MapPin size={10} className="text-emerald-400" />
-                Solar Plant A — India
+            <div className="flex items-center gap-2 mt-1.5">
+              {/* Feature 2: Location selector */}
+              <div className="relative">
+                <button
+                  onClick={() => setLocationOpen(o => !o)}
+                  className="flex items-center gap-1.5 weather-chip cursor-pointer"
+                >
+                  <MapPin size={10} className="text-emerald-400" />
+                  <span className="max-w-[180px] truncate">{selectedLocation.name}</span>
+                  <ChevronDown size={10} className={`transition-transform ${locationOpen ? "rotate-180" : ""}`} />
+                </button>
+                {locationOpen && (
+                  <div className="absolute top-full left-0 mt-1.5 z-50 rounded-2xl overflow-hidden min-w-[240px]"
+                    style={{ background: "rgba(10,16,22,0.97)", border: "1px solid rgba(52,211,153,0.18)", backdropFilter: "blur(24px)", boxShadow: "0 16px 48px rgba(0,0,0,0.6)" }}
+                  >
+                    {LOCATIONS.map(loc => (
+                      <button key={loc.code}
+                        onClick={() => { setSelectedLocation(loc); setLocationOpen(false); }}
+                        className="w-full flex items-center gap-3 px-4 py-3 text-left text-[13px] transition-colors hover:bg-white/5"
+                        style={{ color: loc.code === selectedLocation.code ? "#34d399" : "rgba(255,255,255,0.6)" }}
+                      >
+                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded" style={{ background: "rgba(52,211,153,0.1)", color: "#34d399" }}>{loc.code}</span>
+                        {loc.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
               {lastUpdated && (
                 <div className="weather-chip">
@@ -354,13 +471,52 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
+          {/* Center: Feature 6 — Live weather strip */}
+          {currentWeather && (
+            <div className="hidden xl:flex items-center gap-5 text-[12px] text-white/45 flex-shrink-0">
+              <div className="flex items-center gap-1.5">
+                <Thermometer size={12} className="text-amber-400" />
+                {currentWeather.temperature_2m?.toFixed(1) ?? "—"}°C
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Droplets size={12} className="text-cyan-400" />
+                {currentWeather.relative_humidity_2m?.toFixed(0) ?? "—"}%
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Cloud size={12} className="text-white/40" />
+                {currentWeather.cloud_cover?.toFixed(0) ?? "—"}%
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Wind size={12} className="text-blue-400" />
+                {currentWeather.wind_speed_10m?.toFixed(1) ?? "—"} km/h
+              </div>
+            </div>
+          )}
+
+          {/* Right: actions */}
+          <div className="flex items-center gap-2 flex-shrink-0">
             {error && (
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs text-amber-400 border" style={{ background: "rgba(251,191,36,0.08)", borderColor: "rgba(251,191,36,0.2)" }}>
                 <AlertTriangle size={12} />
-                {error}
+                Backend offline
               </div>
             )}
+            {/* Feature 5: CSV Export */}
+            <button
+              onClick={handleExportCSV}
+              disabled={forecast.length === 0}
+              title="Export CSV"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all"
+              style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", color: "rgba(255,255,255,0.5)" }}
+            >
+              <Download size={13} />
+              CSV
+            </button>
+            {/* Feature 1: Countdown */}
+            <div className="text-[11px] font-mono tabular-nums px-3 py-2 rounded-xl" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.28)" }}>
+              <RefreshCw size={10} className="inline mr-1 opacity-50" />
+              {String(Math.floor(countdown / 60)).padStart(2, "0")}:{String(countdown % 60).padStart(2, "0")}
+            </div>
             <button
               onClick={() => loadData(true)}
               disabled={refreshing}
@@ -486,11 +642,14 @@ export default function Dashboard() {
               </div>
               
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {alerts.length > 0 ? (
-                  alerts.map((a, i) => (
-                    <div key={i} className="relative">
+                {visibleAlerts.length > 0 ? (
+                  visibleAlerts.map((a, i) => (
+                    <div key={a.id} className="relative group">
                       <AlertItem alert={a} index={i} />
-                      <button className="absolute top-4 right-4 text-[10px] uppercase font-bold tracking-widest px-2 py-1 rounded bg-black/20 hover:bg-black/40 text-white/50 transition-colors">
+                      <button 
+                        onClick={() => setResolvedAlertIds(prev => new Set([...prev, a.id]))}
+                        className="absolute top-4 right-4 text-[10px] uppercase font-bold tracking-widest px-2 py-1 rounded bg-black/20 hover:bg-black/60 text-white/30 hover:text-emerald-400 transition-colors z-10 opacity-0 group-hover:opacity-100 cursor-pointer"
+                      >
                         Resolve
                       </button>
                     </div>
@@ -621,13 +780,17 @@ export default function Dashboard() {
                     <ReferenceLine y={avgGen} stroke="rgba(34,211,238,0.4)" strokeDasharray="4 4" label={{ value: "avg", fill: "rgba(34,211,238,0.6)", fontSize: 10 }} />
                     <Area type="monotone" dataKey="confidenceArea" fill="url(#ciGradient)" stroke="none" name="Confidence Band (85%)" />
                     <Area type="monotone" dataKey="forecast" stroke="#34d399" strokeWidth={0} fill="url(#genGradient)" name="" />
+                    {/* Feature 3: Previous forecast history overlay */}
+                    {historyForecast.length > 0 && (
+                      <Line type="monotone" dataKey="previousForecast" stroke="rgba(255,255,255,0.2)" strokeWidth={1.5} strokeDasharray="5 4" dot={false} name="Prev Forecast (MW)" />
+                    )}
                     <Line type="monotone" dataKey="forecast" stroke="#34d399" strokeWidth={2.5} dot={false} name="Predicted (MW)" activeDot={{ r: 5, fill: "#34d399", strokeWidth: 0 }} />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
 
               {/* Chart legend */}
-              <div className="flex items-center gap-6 mt-4 text-xs text-white/40">
+              <div className="flex items-center gap-6 mt-4 text-xs text-white/40 flex-wrap">
                 <div className="flex items-center gap-2">
                   <div className="w-4 h-0.5 bg-emerald-400 rounded" />
                   <span>Predicted Generation</span>
@@ -640,6 +803,12 @@ export default function Dashboard() {
                   <div className="w-4 h-0.5 bg-cyan-400 rounded" style={{ borderTop: "2px dashed rgb(34,211,238)" }} />
                   <span>Average</span>
                 </div>
+                {historyForecast.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-0" style={{ border: "1.5px dashed rgba(255,255,255,0.3)" }} />
+                    <span>Previous Forecast</span>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -650,18 +819,18 @@ export default function Dashboard() {
                   <AlertTriangle size={16} className="text-amber-400" />
                   Alerts & Actions
                 </h2>
-                <span className="badge badge-warning text-[11px]">{alerts.length} Events</span>
+                <span className="badge badge-warning text-[11px]">{visibleAlerts.length} Events</span>
               </div>
 
               <div className="flex-1 overflow-y-auto space-y-3 scrollbar-thin -mr-1 pr-1 max-h-[340px]">
-                {alerts.length === 0 ? (
+                {visibleAlerts.length === 0 ? (
                   <div className="text-center py-12 text-white/30">
                     <BatteryCharging size={32} className="mx-auto mb-3 text-emerald-400/30" />
                     <p className="font-medium">Grid is Stable</p>
                     <p className="text-xs mt-1">No critical events detected</p>
                   </div>
                 ) : (
-                  alerts.slice(0, 8).map((a, i) => <AlertItem key={a.id} alert={a} index={i} />)
+                  visibleAlerts.slice(0, 8).map((a, i) => <AlertItem key={a.id} alert={a} index={i} />)
                 )}
               </div>
             </div>
